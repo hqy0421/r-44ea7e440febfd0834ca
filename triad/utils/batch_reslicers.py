@@ -1,15 +1,28 @@
+from concurrent.futures import ThreadPoolExecutor
+import itertools
 import math
-from typing import Any, Generic, Iterable, List, Optional, Tuple, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+from triad.utils.assertion import assert_or_throw
 from triad.utils.convert import to_size
 
 from .iter import slice_iterable
 
 T = TypeVar("T")
+ArrowWorker = Callable[[Iterable[pa.Table]], pa.Table]
 
 
 class BatchReslicer(Generic[T]):
@@ -329,3 +342,221 @@ class ArrowTableSortedBatchReslicer(SortedBatchReslicer[pa.Table]):
 
     def concat(self, batches: List[pa.Table]) -> pa.Table:
         return pa.concat_tables(batches)
+
+
+def plan_contiguous_shards(
+    group_row_counts: List[int], max_shards: int
+) -> List[Tuple[int, int]]:
+    """Split a contiguous sequence of groups into at most `max_shards`
+    non-empty shards, minimizing the maximum number of rows of any shard.
+
+    Groups are indivisible: a group (including all its duplicated rows) always
+    stays inside one shard. This is the classic greedy number-partition problem
+    with contiguous items, solved by binary searching the optimal per-shard row
+    capacity, then splitting under-capacity shards until exactly
+    ``min(max_shards, number of groups)`` non-empty shards are produced.
+
+    :param group_row_counts: number of rows of each contiguous group
+    :param max_shards: maximum number of non-empty shards (``K``), must be >= 1
+    :return: a list of ``[group_start, group_end)`` intervals in group order,
+        each non-empty and contiguous, with no group split across intervals
+
+    :raises ValueError: if `max_shards` < 1 or any group has <= 0 rows
+    """
+    assert_or_throw(max_shards >= 1, ValueError("max_shards must be >= 1"))
+    n = len(group_row_counts)
+    if n == 0:
+        return []
+    assert_or_throw(
+        all(c > 0 for c in group_row_counts),
+        ValueError("every group must contain at least one row"),
+    )
+    if n == 1:
+        return [(0, 1)]
+    shard_count = min(max_shards, n)
+    largest = max(group_row_counts)
+    total = sum(group_row_counts)
+
+    def fits(capacity: int) -> bool:
+        used = 1
+        loaded = 0
+        for count in group_row_counts:
+            if loaded + count > capacity:
+                used += 1
+                loaded = count
+                if used > shard_count:
+                    return False
+            else:
+                loaded += count
+        return True
+
+    low, high = largest, total
+    while low < high:
+        mid = (low + high) // 2
+        if fits(mid):
+            high = mid
+        else:
+            low = mid + 1
+    capacity = low
+
+    # greedy fill with the optimal capacity; every produced shard is <= capacity
+    shards: List[List[int]] = []
+    start = 0
+    loaded = 0
+    for i, count in enumerate(group_row_counts):
+        if loaded + count > capacity:
+            shards.append([start, i])
+            start = i
+            loaded = count
+        else:
+            loaded += count
+    shards.append([start, n])
+
+    # extra shards are obtained by splitting shards that hold > 1 group;
+    # splitting never increases any shard's row count beyond `capacity`
+    while len(shards) < shard_count:
+        for j in range(len(shards)):
+            start, end = shards[j]
+            if end - start > 1:
+                mid = (start + end) // 2
+                shards[j : j + 1] = [[start, mid], [mid, end]]
+                break
+    return [(s, e) for s, e in shards]
+
+
+class ArrowShardedParallelProcessor:
+    """Run a worker over an ordered Arrow batch stream in parallel shards.
+
+    The input batches must already be sorted by the declared business `keys`
+    (integer or string columns, ``NULL`` keys are treated as one group). Rows
+    of the same key form one group and a group may span multiple batches.
+    Groups are never split: every row (including duplicated rows) is handed to
+    exactly one worker call.
+
+    The groups are divided into at most `max_shards` contiguous key intervals
+    (:func:`~triad.utils.batch_reslicers.plan_contiguous_shards`) using the real
+    input row counts as load, so the maximum shard row count is globally
+    minimal. Each shard runs in its own worker through a thread pool of
+    `max_shards` threads, and the real Arrow results are concatenated back in
+    interval order. The output of every worker call must strictly match
+    `output_schema` (field order, types and metadata included).
+
+    A failure of any worker, or a schema mismatch, fails the whole processing:
+    the remaining shards are cancelled and no partial result is returned.
+
+    :param keys: ordered business key column names (non-empty)
+    :param output_schema: the strictly required schema of every output table
+    :param max_shards: maximum number of non-empty shards (``K``), must be >= 1
+    :param input_schema: optional schema of the input; when provided, the keys
+        and their integer/string types are validated up front, otherwise they
+        are validated against the first non-empty input batch
+
+    :raises ValueError: if `max_shards` < 1, `keys` is empty, a key is missing
+        from the schema, or a key column is neither integer nor string
+    """
+
+    def __init__(
+        self,
+        keys: List[str],
+        output_schema: pa.Schema,
+        max_shards: int,
+        input_schema: Optional[pa.Schema] = None,
+    ) -> None:
+        assert_or_throw(len(keys) > 0, ValueError("keys must be non-empty"))
+        assert_or_throw(max_shards >= 1, ValueError("max_shards must be >= 1"))
+        self._keys = list(keys)
+        self._output_schema = output_schema
+        self._max_shards = max_shards
+        self._reslicer = ArrowTableSortedBatchReslicer(keys=self._keys)
+        if input_schema is not None:
+            self._check_schema(input_schema)
+
+    def process(self, batches: Iterable[pa.Table], worker: ArrowWorker) -> pa.Table:
+        """Process the sorted batch stream in parallel shards.
+
+        :param batches: Arrow tables already sorted by the declared keys
+        :param worker: callable taking the batches of one shard (an iterable of
+            non-empty :external+pyarrow:class:`pyarrow.Table`) and returning a
+            table strictly matching the declared output schema
+        :return: the concatenation of the workers' real result tables in shard
+            (key interval) order; an empty table with the declared schema for
+            empty input
+
+        :raises ValueError: if the input schema is missing a key column or has
+            a non integer/string key column
+        :raises Exception: if any worker raises, or any worker output does not
+            strictly match the declared output schema
+        """
+        # materialize groups (zero-copy slices) so true row loads are known;
+        # a group spanning batches stays together as one item
+        iterator = iter(batches)
+        first: Optional[pa.Table] = next((b for b in iterator if b.num_rows > 0), None)
+        if first is None:
+            return pa.Table.from_pylist([], schema=self._output_schema)
+        # validate before the reslicer accesses the key columns
+        self._check_schema(first.schema)
+        stream: Iterable[pa.Table] = itertools.chain([first], iterator)
+        groups: List[List[pa.Table]] = []
+        group_counts: List[int] = []
+        for group_batches in self._reslicer.reslice(stream):
+            parts = [b for b in group_batches if b.num_rows > 0]
+            if parts:
+                groups.append(parts)
+                group_counts.append(sum(b.num_rows for b in parts))
+
+        intervals = plan_contiguous_shards(group_counts, self._max_shards)
+
+        def run_shard(index: int) -> pa.Table:
+            start, end = intervals[index]
+
+            def shard_batches() -> Iterable[pa.Table]:
+                for group in groups[start:end]:
+                    yield from group
+
+            try:
+                result = worker(shard_batches())
+            except Exception as e:
+                raise RuntimeError(
+                    f"worker failed on shard {index} (groups [{start}, {end})): {e}"
+                ) from e
+            if not isinstance(result, pa.Table):
+                raise TypeError(
+                    f"worker of shard {index} (groups [{start}, {end})) returned "
+                    f"{type(result).__name__}, expected pyarrow.Table"
+                )
+            if not result.schema.equals(self._output_schema, check_metadata=True):
+                raise ValueError(
+                    f"worker of shard {index} (groups [{start}, {end})) returned "
+                    f"schema {result.schema} which does not match the declared "
+                    f"output schema {self._output_schema}"
+                )
+            return result
+
+        with ThreadPoolExecutor(max_workers=self._max_shards) as pool:
+            futures = [pool.submit(run_shard, i) for i in range(len(intervals))]
+            results: List[Optional[pa.Table]] = []
+            for i, future in enumerate(futures):
+                try:
+                    results.append(future.result())
+                except BaseException:
+                    # the whole processing fails: never return partial results
+                    for pending in futures[i + 1 :]:
+                        pending.cancel()
+                    raise
+        return pa.concat_tables(results)
+
+    def _check_schema(self, schema: pa.Schema) -> None:
+        for key in self._keys:
+            assert_or_throw(
+                key in schema.names,
+                ValueError(f"key column '{key}' is not found in input schema"),
+            )
+            data_type = schema.field(key).type
+            assert_or_throw(
+                pa.types.is_integer(data_type)
+                or pa.types.is_string(data_type)
+                or pa.types.is_large_string(data_type),
+                ValueError(
+                    f"key column '{key}' must be integer or string, got {data_type}"
+                ),
+            )
